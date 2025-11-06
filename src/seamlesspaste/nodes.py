@@ -5,7 +5,7 @@ from pathlib import Path
 from scipy.ndimage import distance_transform_edt
 import torch
 from PIL import Image
-import torchvision.transforms as transformsclass
+import torchvision.transforms as transforms
 
 class Example:
     """
@@ -37,25 +37,21 @@ class Example:
     @classmethod
     def INPUT_TYPES(s):
         return {
-           "required": {
-               "base_image_path": ("STRING", { "tooltip": "This is an image"}),
-               "tile_path": ("STRING", { "tooltip": "This is an tile path"}),
-               "output_path": ("STRING", { "tooltip": "Output path"}),
-               "x": ("INT", {"min": 0, "max": 10000}),
-               "y": ("INT", {"min": 0, "max": 10000}),
-               "feather_width": ("INT",  {"min": 0, "max": 10000}),
-           },
-    }
+            "required": {
+                "base_image": ("IMAGE", {"tooltip": "Base image in tensor format"}),
+                "tile": ("IMAGE", {"tooltip": "Tile image in tensor format (with alpha channel)"}),
+                "x": ("INT", {"min": 0, "max": 10000}),
+                "y": ("INT", {"min": 0, "max": 10000}),
+                "feather_width": ("INT", {"min": 0, "max": 10000}),
+            },
+        }
     
-    #RETURN_TYPES = ()
     RETURN_TYPES = ("IMAGE",)
-    #RETURN_NAMES = ("image_output_name",)
+    RETURN_NAMES = ("image_output",)
     DESCRIPTION = cleandoc(__doc__)
     FUNCTION = "feather_tile_into_image"
     
     OUTPUT_NODE = True
-    #OUTPUT_TOOLTIPS = ("",) # Tooltips for the output node
-    
     CATEGORY = "Example"
 
     def create_feather_mask(self, height, width, alpha, feather_width):
@@ -85,40 +81,37 @@ class Example:
         
         return mask
     
-    def feather_tile_into_image(self, base_image_path, tile_path, output_path, x, y, feather_width):
+    def feather_tile_into_image(self, base_image, tile, x, y, feather_width):
         """
-        Feather a tile with alpha channel into a 5376x5376 image at coordinates (x, y).
+        Feather a tile with alpha channel into a base image at coordinates (x, y).
         
         Args:
-            base_image_path: Path to the base image (5376x5376, RGB)
-            tile_path: Path to the tile image (any size, RGBA)
+            base_image: Base image tensor (batch, height, width, 3), RGB, [0, 1]
+            tile: Tile image tensor (batch, tile_height, tile_width, 4), RGBA, [0, 1]
             x: X-coordinate of the top-left corner of the tile's bounding box
             y: Y-coordinate of the top-left corner of the tile's bounding box
             feather_width: Width of feathering region for blending
-            output_path: Path to save the resulting image
+        Returns:
+            Tensor of the resulting image (1, height, width, 3), RGB, [0, 1]
         """
-        # Resolve paths
-        base_image_path = Path(base_image_path)
-        tile_path = Path(tile_path)
-        output_path = Path(output_path)
-    
-        # Load base image (RGB)
-        base_img = cv2.imread(str(base_image_path), cv2.IMREAD_COLOR)
-        if base_img is None:
-            raise ValueError(f"Failed to load base image: {base_image_path}")
+        # Convert input tensors to NumPy arrays (OpenCV format)
+        # Remove batch dimension and convert from RGB [0, 1] to BGR [0, 255]
+        base_img = base_image[0].cpu().numpy()  # Shape: (height, width, 3)
+        base_img = (base_img * 255).astype(np.uint8)  # Scale to [0, 255]
+        base_img = cv2.cvtColor(base_img, cv2.COLOR_RGB2BGR)  # Convert to BGR
         
+        tile = tile[0].cpu().numpy()  # Shape: (tile_height, tile_width, 4)
+        tile = (tile * 255).astype(np.uint8)  # Scale to [0, 255]
+        # Tile is already in RGBA format (no color conversion needed)
+
+        # Get dimensions
         height, width, channels = base_img.shape
-    
-        # Load tile (RGBA)
-        tile = cv2.imread(str(tile_path), cv2.IMREAD_UNCHANGED)
-        if tile is None:
-            raise ValueError(f"Failed to load tile image: {tile_path}")
-        
         tile_height, tile_width, tile_channels = tile.shape
+
+        # Validate inputs
         if tile_channels != 4:
             raise ValueError(f"Tile must have an alpha channel (expected 4 channels, got {tile_channels})")
         
-        # Check bounds
         if x < 0 or y < 0 or x + tile_width > width or y + tile_height > height:
             raise ValueError(
                 f"Tile of size {tile_width}x{tile_height} at (x={x}, y={y}) "
@@ -130,6 +123,7 @@ class Example:
     
         # Split tile into RGB and alpha
         tile_rgb = tile[:, :, :3].astype(np.float32)
+        tile_rgb = cv2.cvtColor(tile_rgb, cv2.COLOR_RGB2BGR)
         tile_alpha = tile[:, :, 3].astype(np.float32) / 255.0  # Normalize to [0, 1]
     
         # Create feathering mask based on alpha channel
@@ -138,30 +132,27 @@ class Example:
     
         # Convert base image to float
         base_img = base_img.astype(np.float32)
+        tile_rgb = tile_rgb.astype(np.float32)
     
         # Extract the region of the base image
         base_region = base_img[y:y+tile_height, x:x+tile_width]
     
         # Blend using alpha and feather mask
-        # Effective mask combines alpha (for transparency) and feather mask (for blending)
         effective_mask = tile_alpha[:, :, np.newaxis] * feather_mask
         blended_region = base_region * (1 - effective_mask) + tile_rgb * effective_mask
     
         # Update base image
         base_img[y:y+tile_height, x:x+tile_width] = blended_region
         
+        # Convert back to RGB for tensor output
         base_img_rgb = cv2.cvtColor(base_img, cv2.COLOR_BGR2RGB)
-    
-        base_img_tensor = base_img_rgb / 255.0
+        base_img_tensor = base_img_rgb / 255.0  # Normalize to [0, 1]
     
         # Save result
         base_img = np.clip(base_img, 0, 255).astype(np.uint8)
-        cv2.imwrite(str(output_path), base_img)
 
         result_tensor = torch.from_numpy(base_img_tensor).float().unsqueeze(0)  # Shape: (1, height, width, 3)
-        print(f"Feathered tile of size {tile_width}x{tile_height} into image and saved to {output_path}")
         return (result_tensor,)
-#        return {}
 
 NODE_CLASS_MAPPINGS = {
     "Example": Example
