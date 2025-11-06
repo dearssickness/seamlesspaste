@@ -1,147 +1,172 @@
 from inspect import cleandoc
 import cv2
 import numpy as np
+from pathlib import Path
 from scipy.ndimage import distance_transform_edt
 import torch
+from PIL import Image
+import torchvision.transforms as transformsclass
 
 class Example:
     """
     A ComfyUI node to feather a tile image into a base image at specified coordinates.
-    This version properly feathers only from visible areas and supports bi-directional (in/out) feathering.
-    """
 
+    Class methods
+    -------------
+    INPUT_TYPES (dict):
+        Defines input parameters for the node.
+    IS_CHANGED:
+        Optional method to control when the node is re-executed.
+
+    Attributes
+    ----------
+    RETURN_TYPES (`tuple`):
+        The type of each element in the output tuple.
+    RETURN_NAMES (`tuple`):
+        Names of each output in the output tuple.
+    FUNCTION (`str`):
+        The entry-point method name.
+    OUTPUT_NODE (`bool`):
+        Indicates if this is an output node.
+    CATEGORY (`str`):
+        The category for the node in the UI.
+    """
     def __init__(self):
         pass
-
+    
     @classmethod
-    def INPUT_TYPES(cls):
+    def INPUT_TYPES(s):
         return {
-            "required": {
-                "base_image": ("IMAGE", {"tooltip": "Base image (RGB, tensor)"}),
-                "tile_image": ("IMAGE", {"tooltip": "Tile image (RGBA or RGB, tensor)"}),
-                "x": ("INT", {"min": 0, "max": 10000, "tooltip": "X-coordinate for tile placement"}),
-                "y": ("INT", {"min": 0, "max": 10000, "tooltip": "Y-coordinate for tile placement"}),
-                "feather_width": ("INT", {"min": 0, "max": 10000, "tooltip": "Width of feathering region"}),
-            },
-        }
-
+           "required": {
+               "base_image_path": ("STRING", { "tooltip": "This is an image"}),
+               "tile_path": ("STRING", { "tooltip": "This is an tile path"}),
+               "output_path": ("STRING", { "tooltip": "Output path"}),
+               "x": ("INT", {"min": 0, "max": 10000}),
+               "y": ("INT", {"min": 0, "max": 10000}),
+               "feather_width": ("INT",  {"min": 0, "max": 10000}),
+           },
+    }
+    
+    #RETURN_TYPES = ()
     RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image_output",)
-    FUNCTION = "feather_tile_into_image"
-    CATEGORY = "Example"
-    OUTPUT_NODE = True
+    #RETURN_NAMES = ("image_output_name",)
     DESCRIPTION = cleandoc(__doc__)
+    FUNCTION = "feather_tile_into_image"
+    
+    OUTPUT_NODE = True
+    #OUTPUT_TOOLTIPS = ("",) # Tooltips for the output node
+    
+    CATEGORY = "Example"
 
-    # -------------------------------------------------------------------------
-    # Feather Mask Creation
-    # -------------------------------------------------------------------------
-    def create_feather_mask(self, alpha, feather_width):
+    def create_feather_mask(self, height, width, alpha, feather_width):
         """
-        Create a bi-directional feathering mask that starts from visible alpha edges.
-        Feathers both inward (toward opaque) and outward (toward transparent) smoothly.
-
+        Create a feathering mask based on the alpha channel of the tile.
+        
         Args:
-            alpha (np.ndarray): Alpha channel (0 to 1)
-            feather_width (int): Width of feathering in pixels
-
+            height: Height of the tile
+            width: Width of the tile
+            alpha: Alpha channel of the tile (0 for transparent, 255 for opaque)
+            feather_width: Width of feathering region
         Returns:
-            np.ndarray: Mask (0..1) where 1 = fully visible, 0 = transparent
+            Mask with values 0 to 1, feathering from visible pixel boundaries
         """
-        if feather_width <= 0:
-            return alpha.astype(np.float32)
-
-        # Binary mask for where pixels are visible
-        binary_alpha = (alpha > 0).astype(np.uint8)
-
-        # Distances from transparency and from opacity
-        dist_inside = distance_transform_edt(binary_alpha)          # inside opaque region
-        dist_outside = distance_transform_edt(1 - binary_alpha)     # outside opaque region
-
-        # Normalized distances
-        inside_mask = np.clip(dist_inside / feather_width, 0, 1)
-        outside_mask = np.clip(1 - (dist_outside / feather_width), 0, 1)
-
-        # Combine for a smooth bi-directional falloff
-        combined_mask = np.where(binary_alpha > 0, inside_mask, outside_mask)
-
-        # Multiply by alpha to respect existing transparency
-        return combined_mask * alpha
-
-    # -------------------------------------------------------------------------
-    # Main blending logic
-    # -------------------------------------------------------------------------
-    def feather_tile_into_image(self, base_image, tile_image, x, y, feather_width):
+        # Ensure feather is at least 1
+        feather = max(1, feather_width // 2)
+        
+        # Normalize alpha to binary (0 for transparent, 1 for visible)
+        binary_alpha = (alpha > 0).astype(np.float32)
+        
+        # Compute distance transform from the edge of visible pixels
+        # Distance is 0 at transparent pixels, positive inside visible regions
+        dist = distance_transform_edt(binary_alpha)
+        
+        # Create mask: 0 at transparent pixels, ramping up to 1 inside visible area
+        mask = np.clip(dist / feather, 0, 1)
+        
+        return mask
+    
+    def feather_tile_into_image(self, base_image_path, tile_path, output_path, x, y, feather_width):
         """
-        Feather a tile image into a base image at coordinates (x, y).
-
+        Feather a tile with alpha channel into a 5376x5376 image at coordinates (x, y).
+        
         Args:
-            base_image (torch.Tensor): Base image tensor (1, H, W, 3), RGB, [0,1]
-            tile_image (torch.Tensor): Tile image tensor (1, h, w, 3 or 4), RGB(A), [0,1]
-            x (int): X-coordinate of the top-left corner of the tile
-            y (int): Y-coordinate of the top-left corner of the tile
-            feather_width (int): Width of feathering region
-
-        Returns:
-            (torch.Tensor,): Resulting blended image tensor (1, H, W, 3)
+            base_image_path: Path to the base image (5376x5376, RGB)
+            tile_path: Path to the tile image (any size, RGBA)
+            x: X-coordinate of the top-left corner of the tile's bounding box
+            y: Y-coordinate of the top-left corner of the tile's bounding box
+            feather_width: Width of feathering region for blending
+            output_path: Path to save the resulting image
         """
-        # Convert from torch to numpy
-        base_image = base_image[0].cpu().numpy()  # (H, W, 3)
-        tile_image = tile_image[0].cpu().numpy()  # (h, w, 3 or 4)
-
-        height, width, channels = base_image.shape
-        tile_height, tile_width, tile_channels = tile_image.shape
-
-        # Validate
-        if channels != 3:
-            raise ValueError(f"Base image must have 3 channels (RGB), got {channels}")
-        if tile_channels not in (3, 4):
-            raise ValueError(f"Tile image must have 3 or 4 channels, got {tile_channels}")
-
-        # Extract RGB + Alpha
-        if tile_channels == 4:
-            tile_rgb = tile_image[:, :, :3]
-            tile_alpha = tile_image[:, :, 3]
-        else:
-            tile_rgb = tile_image
-            tile_alpha = np.ones((tile_height, tile_width), dtype=np.float32)
-
-        # Check placement bounds
+        # Resolve paths
+        base_image_path = Path(base_image_path)
+        tile_path = Path(tile_path)
+        output_path = Path(output_path)
+    
+        # Load base image (RGB)
+        base_img = cv2.imread(str(base_image_path), cv2.IMREAD_COLOR)
+        if base_img is None:
+            raise ValueError(f"Failed to load base image: {base_image_path}")
+        
+        height, width, channels = base_img.shape
+    
+        # Load tile (RGBA)
+        tile = cv2.imread(str(tile_path), cv2.IMREAD_UNCHANGED)
+        if tile is None:
+            raise ValueError(f"Failed to load tile image: {tile_path}")
+        
+        tile_height, tile_width, tile_channels = tile.shape
+        if tile_channels != 4:
+            raise ValueError(f"Tile must have an alpha channel (expected 4 channels, got {tile_channels})")
+        
+        # Check bounds
         if x < 0 or y < 0 or x + tile_width > width or y + tile_height > height:
             raise ValueError(
                 f"Tile of size {tile_width}x{tile_height} at (x={x}, y={y}) "
                 f"is out of bounds for {width}x{height} image"
             )
-
-        # Limit feather width
+    
+        # Adjust feather width to avoid exceeding tile dimensions
         feather_width = min(feather_width, tile_width // 2, tile_height // 2)
+    
+        # Split tile into RGB and alpha
+        tile_rgb = tile[:, :, :3].astype(np.float32)
+        tile_alpha = tile[:, :, 3].astype(np.float32) / 255.0  # Normalize to [0, 1]
+    
+        # Create feathering mask based on alpha channel
+        feather_mask = self.create_feather_mask(tile_height, tile_width, tile_alpha, feather_width)
+        feather_mask = np.stack([feather_mask] * 3, axis=2)  # Match RGB channels
+    
+        # Convert base image to float
+        base_img = base_img.astype(np.float32)
+    
+        # Extract the region of the base image
+        base_region = base_img[y:y+tile_height, x:x+tile_width]
+    
+        # Blend using alpha and feather mask
+        # Effective mask combines alpha (for transparency) and feather mask (for blending)
+        effective_mask = tile_alpha[:, :, np.newaxis] * feather_mask
+        blended_region = base_region * (1 - effective_mask) + tile_rgb * effective_mask
+    
+        # Update base image
+        base_img[y:y+tile_height, x:x+tile_width] = blended_region
+        
+        base_img_rgb = cv2.cvtColor(base_img, cv2.COLOR_BGR2RGB)
+    
+        base_img_tensor = base_img_rgb / 255.0
+    
+        # Save result
+        base_img = np.clip(base_img, 0, 255).astype(np.uint8)
+        cv2.imwrite(str(output_path), base_img)
 
-        # --- Create feathering mask ---
-        feather_mask = self.create_feather_mask(tile_alpha, feather_width)
-        feather_mask = np.stack([feather_mask] * 3, axis=2)  # (h, w, 3)
-
-        # --- Extract region from base image ---
-        base_img = base_image.astype(np.float32)
-        base_region = base_img[y:y + tile_height, x:x + tile_width]
-
-        # --- Blend ---
-        blended_region = base_region * (1 - feather_mask) + tile_rgb * feather_mask
-
-        # --- Update base image ---
-        base_img[y:y + tile_height, x:x + tile_width] = blended_region
-
-        # Convert back to tensor
-        result_tensor = torch.from_numpy(np.clip(base_img, 0, 1)).float().unsqueeze(0)
-        cv2.imwrite("base_img_100.png", (base_img * 255).astype(np.uint8))
+        result_tensor = torch.from_numpy(base_img_tensor).float().unsqueeze(0)  # Shape: (1, height, width, 3)
+        print(f"Feathered tile of size {tile_width}x{tile_height} into image and saved to {output_path}")
         return (result_tensor,)
+#        return {}
 
-
-# -------------------------------------------------------------------------
-# Node Mappings for ComfyUI
-# -------------------------------------------------------------------------
 NODE_CLASS_MAPPINGS = {
     "Example": Example
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "Example": "Example Feather Node"
+    "Example": "Example Node"
 }
